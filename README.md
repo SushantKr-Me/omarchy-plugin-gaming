@@ -57,7 +57,7 @@ A comprehensive gaming dashboard, performance optimizer, and MangoHud FPS overla
 ## Installation & Setup
 
 ```bash
-omarchy plugin add [https://github.com/SushantKr-Me/omarchy-plugin-gaming.git --enable
+omarchy plugin add https://github.com/SushantKr-Me/omarchy-plugin-gaming.git --enable
 ```
 
 ## License
