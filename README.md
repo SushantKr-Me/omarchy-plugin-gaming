@@ -56,47 +56,9 @@ A comprehensive gaming dashboard, performance optimizer, and MangoHud FPS overla
 
 ## Installation & Setup
 
-### 1. Dependencies
-
-Install the required gaming and control utilities on Arch Linux:
-
 ```bash
-sudo pacman -S mangohud gamemode wtype power-profiles-daemon
+omarchy plugin add [https://github.com/SushantKr-Me/omarchy-plugin-gaming.git --enable
 ```
-
-### 2. Install Plugin
-
-Clone or copy `sushantkr.gaming` into your Omarchy plugins directory:
-
-```bash
-mkdir -p ~/.config/omarchy/plugins
-cp -r sushantkr.gaming ~/.config/omarchy/plugins/
-chmod +x ~/.config/omarchy/plugins/sushantkr.gaming/scripts/game-ctl
-```
-
-### 3. Add to Status Bar
-
-Add the widget to `~/.config/omarchy/shell.json` inside your desired bar section (e.g. `right`):
-
-```json
-{
-  "id": "sushantkr.gaming"
-}
-```
-
-Or enable it using the Omarchy CLI:
-
-```bash
-omarchy plugin enable sushantkr.gaming right
-```
-
-### 4. Reload Shell
-
-```bash
-omarchy restart shell
-```
-
----
 
 ## License
 
