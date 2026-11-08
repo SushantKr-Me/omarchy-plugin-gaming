@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Omarchy Gaming Hub Helper CLI
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-gaming"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/MangoHud"
+MANGO_CONF="$CONFIG_DIR/MangoHud.conf"
+STATE_FILE="$CACHE_DIR/state.json"
+PREV_STATE_FILE="$CACHE_DIR/prev_state.json"
+
+mkdir -p "$CACHE_DIR" "$CONFIG_DIR"
+
+# Ensure default MangoHud config exists if not present
+init_mangohud_conf() {
+  if [[ ! -f "$MANGO_CONF" ]]; then
+    cat << 'EOF' > "$MANGO_CONF"
+### Omarchy Gaming Hub MangoHud Config ###
+legacy_layout=0
+fps
+frametime=1
+frame_timing=1
+cpu_stats=1
+cpu_temp=1
+cpu_load_change=1
+cpu_mhz=1
+gpu_stats=1
+gpu_temp=1
+gpu_load_change=1
+gpu_core_clock=1
+gpu_mem_clock=1
+vram=1
+ram=1
+fps_limit=0
+toggle_fps_limit=Shift_L+F1
+toggle_hud=Shift_R+F12
+position=top-left
+round_corners=8
+font_size=24
+background_alpha=0.6
+EOF
+  fi
+}
+
+init_mangohud_conf
+
+cmd="${1:-status}"
+shift || true
+
+case "$cmd" in
+  status)
+    # Check MangoHud & Tools installation
+    has_mangohud=false; which mangohud &>/dev/null && has_mangohud=true
+    has_gamemode=false; which gamemoderun &>/dev/null && has_gamemode=true
+    has_gamescope=false; which gamescope &>/dev/null && has_gamescope=true
+    has_steam=false; which steam &>/dev/null && has_steam=true
+    has_heroic=false; which heroic &>/dev/null && has_heroic=true
+    has_lutris=false; which lutris &>/dev/null && has_lutris=true
+
+    # Read MangoHud settings
+    fps_overlay_enabled=true
+    if grep -qE "^\s*no_display\b" "$MANGO_CONF" 2>/dev/null; then
+      fps_overlay_enabled=false
+    fi
+
+    pos="top-left"
+    pos_match=$(grep -E "^\s*position=" "$MANGO_CONF" 2>/dev/null | tail -n1 | cut -d= -f2 || true)
+    [[ -n "$pos_match" ]] && pos="$pos_match"
+
+    fps_cap=0
+    cap_match=$(grep -E "^\s*fps_limit=" "$MANGO_CONF" 2>/dev/null | tail -n1 | cut -d= -f2 | cut -d, -f1 || true)
+    [[ -n "$cap_match" && "$cap_match" =~ ^[0-9]+$ ]] && fps_cap="$cap_match"
+
+    feat_fps=true; grep -qE "^\s*fps\b" "$MANGO_CONF" 2>/dev/null || feat_fps=false
+    feat_frametime=true; grep -qE "^\s*frametime\b" "$MANGO_CONF" 2>/dev/null || feat_frametime=false
+    feat_cpu=true; grep -qE "^\s*cpu_stats\b" "$MANGO_CONF" 2>/dev/null || feat_cpu=false
+    feat_gpu=true; grep -qE "^\s*gpu_stats\b" "$MANGO_CONF" 2>/dev/null || feat_gpu=false
+    feat_vram=true; grep -qE "^\s*vram\b" "$MANGO_CONF" 2>/dev/null || feat_vram=false
+    feat_ram=true; grep -qE "^\s*ram\b" "$MANGO_CONF" 2>/dev/null || feat_ram=false
+    feat_batt=true; grep -qE "^\s*battery\b" "$MANGO_CONF" 2>/dev/null || feat_batt=false
+
+    # Power Profile
+    power_profile="balanced"
+    if which powerprofilesctl &>/dev/null; then
+      power_profile=$(powerprofilesctl get 2>/dev/null || echo "balanced")
+    fi
+
+    # Hyprland Options
+    anim_enabled=true
+    blur_enabled=true
+    tearing_enabled=false
+    vrr_enabled=false
+
+    if which hyprctl &>/dev/null; then
+      if hyprctl getoption animations:enabled -j 2>/dev/null | grep -q '"bool": false'; then
+        anim_enabled=false
+      fi
+      if hyprctl getoption decoration:blur:enabled -j 2>/dev/null | grep -q '"bool": false'; then
+        blur_enabled=false
+      fi
+      if hyprctl getoption general:allow_tearing -j 2>/dev/null | grep -q '"bool": true'; then
+        tearing_enabled=true
+      fi
+      if hyprctl getoption misc:vrr -j 2>/dev/null | grep -qE '"int": [12]'; then
+        vrr_enabled=true
+      fi
+    fi
+
+    # Master Game Boost is active if power is performance OR (anim off AND tearing on)
+    game_boost=false
+    if [[ "$power_profile" == "performance" || ("$anim_enabled" == "false" && "$tearing_enabled" == "true") ]]; then
+      game_boost=true
+    fi
+
+    # NVIDIA GPU Stats
+    gpu_name="GPU"
+    gpu_temp=0
+    gpu_util=0
+    gpu_vram_used=0
+    gpu_vram_total=0
+    gpu_power=0
+    if which nvidia-smi &>/dev/null; then
+      gpu_data=$(nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)
+      if [[ -n "$gpu_data" ]]; then
+        IFS=',' read -r g_name g_temp g_util g_vused g_vtotal g_pow <<< "$gpu_data"
+        gpu_name=$(echo "$g_name" | xargs)
+        gpu_temp=$(echo "$g_temp" | xargs)
+        gpu_util=$(echo "$g_util" | xargs)
+        gpu_vram_used=$(echo "$g_vused" | xargs)
+        gpu_vram_total=$(echo "$g_vtotal" | xargs)
+        gpu_power=$(echo "$g_pow" | xargs)
+      fi
+    fi
+
+    # CPU info
+    cpu_governor="default"
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+      cpu_governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "default")
+    fi
+
+    cpu_freq=0
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]]; then
+      raw_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo "0")
+      cpu_freq=$(( raw_freq / 1000 ))
+    fi
+
+    # Mic Mute state
+    mic_muted=false
+    if which wpctl &>/dev/null; then
+      if wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null | grep -q "\[MUTED\]"; then
+        mic_muted=true
+      fi
+    fi
+
+    # Crosshair state from cache
+    crosshair_enabled=false
+    crosshair_style="dot"
+    crosshair_color="#00FF66"
+    crosshair_size=16
+    if [[ -f "$CACHE_DIR/crosshair.json" ]]; then
+      crosshair_enabled=$(jq -r '.enabled // false' "$CACHE_DIR/crosshair.json" 2>/dev/null || echo "false")
+      crosshair_style=$(jq -r '.style // "dot"' "$CACHE_DIR/crosshair.json" 2>/dev/null || echo "dot")
+      crosshair_color=$(jq -r '.color // "#00FF66"' "$CACHE_DIR/crosshair.json" 2>/dev/null || echo "#00FF66")
+      crosshair_size=$(jq -r '.size // 16' "$CACHE_DIR/crosshair.json" 2>/dev/null || echo "16")
+    fi
+
+    # Active game scanner
+    game_running=false
+    game_title=""
+    game_class=""
+    game_pid=0
+
+    # 1. Check Hyprland clients for known games/launchers or fullscreen
+    if which hyprctl &>/dev/null; then
+      client_json=$(hyprctl clients -j 2>/dev/null || echo "[]")
+      # Find client matching game signatures
+      game_match=$(echo "$client_json" | jq -c '
+        [.[] | select(
+          (.class | test("steam_app_|heroic|lutris|wine|retroarch|ryujinx|rpcs3|dolphin|osu|cs2|valheim|factorio"; "i")) or
+          (.initialClass | test("steam_app_|heroic|lutris|wine"; "i")) or
+          (.tearingHint == true) or
+          ((.fullscreen == 1 or .fullscreen == 2) and (.class != "antigravity" and .class != "foot" and .class != "kitty" and .class != "zen-browser" and .class != "chromium" and .class != "firefox"))
+        )] | first // null
+      ')
+
+      if [[ "$game_match" != "null" && -n "$game_match" ]]; then
+        game_running=true
+        game_title=$(echo "$game_match" | jq -r '.title // ""')
+        game_class=$(echo "$game_match" | jq -r '.class // ""')
+        game_pid=$(echo "$game_match" | jq -r '.pid // 0')
+      fi
+    fi
+
+    title_json=$(jq -n --arg t "$game_title" '$t')
+
+    # Output consolidated JSON
+    cat << EOF
+{
+  "game_boost": $game_boost,
+  "power_profile": "$power_profile",
+  "animations_enabled": $anim_enabled,
+  "blur_enabled": $blur_enabled,
+  "tearing_enabled": $tearing_enabled,
+  "vrr_enabled": $vrr_enabled,
+  "mangohud_installed": $has_mangohud,
+  "gamemode_installed": $has_gamemode,
+  "gamescope_installed": $has_gamescope,
+  "steam_installed": $has_steam,
+  "heroic_installed": $has_heroic,
+  "lutris_installed": $has_lutris,
+  "fps_overlay_enabled": $fps_overlay_enabled,
+  "mangohud_pos": "$pos",
+  "fps_cap": $fps_cap,
+  "features": {
+    "fps": $feat_fps,
+    "frametime": $feat_frametime,
+    "cpu": $feat_cpu,
+    "gpu": $feat_gpu,
+    "vram": $feat_vram,
+    "ram": $feat_ram,
+    "battery": $feat_batt
+  },
+  "gpu": {
+    "name": "$gpu_name",
+    "temp": ${gpu_temp:-0},
+    "util": ${gpu_util:-0},
+    "vram_used": ${gpu_vram_used:-0},
+    "vram_total": ${gpu_vram_total:-0},
+    "power": ${gpu_power:-0}
+  },
+  "cpu": {
+    "governor": "$cpu_governor",
+    "freq_mhz": $cpu_freq
+  },
+  "mic_muted": $mic_muted,
+  "crosshair": {
+    "enabled": $crosshair_enabled,
+    "style": "$crosshair_style",
+    "color": "$crosshair_color",
+    "size": $crosshair_size
+  },
+  "active_game": {
+    "running": $game_running,
+    "title": $title_json,
+    "class": "$game_class",
+    "pid": $game_pid
+  }
+}
+EOF
+    ;;
+
+  boost)
+    target="${1:-toggle}"
+    current_boost=false
+    if which powerprofilesctl &>/dev/null; then
+      [[ "$(powerprofilesctl get 2>/dev/null || true)" == "performance" ]] && current_boost=true
+    fi
+
+    if [[ "$target" == "toggle" ]]; then
+      if [[ "$current_boost" == "true" ]]; then
+        target="off"
+      else
+        target="on"
+      fi
+    fi
+
+    if [[ "$target" == "on" ]]; then
+      # Save previous state
+      if which powerprofilesctl &>/dev/null; then
+        cur_prof=$(powerprofilesctl get 2>/dev/null || echo "balanced")
+        echo "{\"power_profile\": \"$cur_prof\"}" > "$PREV_STATE_FILE"
+        powerprofilesctl set performance 2>/dev/null || true
+      fi
+      if which hyprctl &>/dev/null; then
+        hyprctl --batch "keyword animations:enabled 0; keyword decoration:blur:enabled 0; keyword decoration:shadow:enabled 0; keyword general:allow_tearing 1; keyword misc:vrr 1" &>/dev/null || true
+      fi
+      # Notification feedback if omarchy / notify-send available
+      which notify-send &>/dev/null && notify-send -u low -i input-gaming "Gaming Hub" "Game Boost Activated: Performance Profile & Zero-Latency Tearing Enabled" || true
+    else
+      # Restore previous state
+      prev_prof="balanced"
+      if [[ -f "$PREV_STATE_FILE" ]]; then
+        prev_prof=$(jq -r '.power_profile // "balanced"' "$PREV_STATE_FILE" 2>/dev/null || echo "balanced")
+      fi
+      if which powerprofilesctl &>/dev/null; then
+        powerprofilesctl set "$prev_prof" 2>/dev/null || powerprofilesctl set balanced 2>/dev/null || true
+      fi
+      if which hyprctl &>/dev/null; then
+        hyprctl --batch "keyword animations:enabled 1; keyword decoration:blur:enabled 1; keyword general:allow_tearing 0; keyword misc:vrr 0" &>/dev/null || true
+      fi
+      which notify-send &>/dev/null && notify-send -u low -i input-gaming "Gaming Hub" "Game Boost Deactivated: Normal Desktop Restored" || true
+    fi
+    echo "ok"
+    ;;
+
+  toggle-fps)
+    target="${1:-toggle}"
+    is_hidden=false
+    grep -qE "^\s*no_display\b" "$MANGO_CONF" 2>/dev/null && is_hidden=true
+
+    if [[ "$target" == "toggle" ]]; then
+      if [[ "$is_hidden" == "true" ]]; then
+        target="on"
+      else
+        target="off"
+      fi
+    fi
+
+    if [[ "$target" == "off" ]]; then
+      # Disable/Hide MangoHud
+      if ! grep -qE "^\s*no_display\b" "$MANGO_CONF" 2>/dev/null; then
+        echo -e "\nno_display" >> "$MANGO_CONF"
+      fi
+      systemctl --user unset-environment MANGOHUD 2>/dev/null || true
+      which notify-send &>/dev/null && notify-send -u low -i display "Gaming Hub" "FPS Overlay: OFF" || true
+    else
+      # Enable MangoHud
+      sed -i -E '/^\s*no_display\b/d' "$MANGO_CONF" 2>/dev/null || true
+      systemctl --user set-environment MANGOHUD=1 2>/dev/null || true
+      which notify-send &>/dev/null && notify-send -u low -i display "Gaming Hub" "FPS Overlay: ON" || true
+    fi
+
+    # Send hotkey to active window via wtype so in-game HUD toggles live!
+    if which wtype &>/dev/null; then
+      wtype -M shift -k F12 -m shift 2>/dev/null || true
+    fi
+    echo "ok"
+    ;;
+
+  set-preset)
+    preset="${1:-compact}"
+    case "$preset" in
+      minimal)
+        cat << 'EOF' > "$MANGO_CONF"
+### Omarchy Gaming Hub - Minimal Preset ###
+legacy_layout=0
+fps
+frametime=1
+fps_limit=0
+toggle_fps_limit=Shift_L+F1
+toggle_hud=Shift_R+F12
+position=top-left
+round_corners=8
+font_size=24
+background_alpha=0.5
+EOF
+        ;;
+      compact)
+        cat << 'EOF' > "$MANGO_CONF"
+### Omarchy Gaming Hub - Compact Preset ###
+legacy_layout=0
+fps
+frametime=1
+cpu_stats=1
+cpu_temp=1
+gpu_stats=1
+gpu_temp=1
+fps_limit=0
+toggle_fps_limit=Shift_L+F1
+toggle_hud=Shift_R+F12
+position=top-left
+round_corners=8
+font_size=24
+background_alpha=0.6
+EOF
+        ;;
+      full)
+        cat << 'EOF' > "$MANGO_CONF"
+### Omarchy Gaming Hub - Full Telemetry Preset ###
+legacy_layout=0
+fps
+frametime=1
+frame_timing=1
+cpu_stats=1
+cpu_temp=1
+cpu_load_change=1
+cpu_mhz=1
+gpu_stats=1
+gpu_temp=1
+gpu_load_change=1
+gpu_core_clock=1
+gpu_mem_clock=1
+vram=1
+ram=1
+battery=1
+fps_limit=0
+toggle_fps_limit=Shift_L+F1
+toggle_hud=Shift_R+F12
+position=top-left
+round_corners=8
+font_size=24
+background_alpha=0.6
+EOF
+        ;;
+    esac
+    which notify-send &>/dev/null && notify-send -u low -i preferences-desktop "Gaming Hub" "MangoHud Preset: $preset" || true
+    echo "ok"
+    ;;
+
+  set-fps-cap)
+    cap="${1:-0}"
+    if grep -qE "^\s*fps_limit=" "$MANGO_CONF" 2>/dev/null; then
+      sed -i -E "s/^\s*fps_limit=.*/fps_limit=$cap/" "$MANGO_CONF"
+    else
+      echo "fps_limit=$cap" >> "$MANGO_CONF"
+    fi
+    echo "ok"
+    ;;
+
+  set-position)
+    pos="${1:-top-left}"
+    if grep -qE "^\s*position=" "$MANGO_CONF" 2>/dev/null; then
+      sed -i -E "s/^\s*position=.*/position=$pos/" "$MANGO_CONF"
+    else
+      echo "position=$pos" >> "$MANGO_CONF"
+    fi
+    echo "ok"
+    ;;
+
+  toggle-feature)
+    feat="${1:-fps}"
+    if grep -qE "^\s*$feat\b" "$MANGO_CONF" 2>/dev/null; then
+      sed -i -E "/^\s*$feat\b/d" "$MANGO_CONF"
+    else
+      echo "$feat=1" >> "$MANGO_CONF"
+    fi
+    echo "ok"
+    ;;
+
+  toggle-hypr)
+    opt="${1:-tearing}"
+    case "$opt" in
+      tearing)
+        cur=$(hyprctl getoption general:allow_tearing -j 2>/dev/null | jq -r '.bool // false')
+        if [[ "$cur" == "true" ]]; then
+          hyprctl keyword general:allow_tearing 0 &>/dev/null
+        else
+          hyprctl keyword general:allow_tearing 1 &>/dev/null
+        fi
+        ;;
+      vrr)
+        cur=$(hyprctl getoption misc:vrr -j 2>/dev/null | jq -r '.int // 0')
+        if [[ "$cur" != "0" ]]; then
+          hyprctl keyword misc:vrr 0 &>/dev/null
+        else
+          hyprctl keyword misc:vrr 1 &>/dev/null
+        fi
+        ;;
+      animations)
+        cur=$(hyprctl getoption animations:enabled -j 2>/dev/null | jq -r '.bool // false')
+        if [[ "$cur" == "true" ]]; then
+          hyprctl keyword animations:enabled 0 &>/dev/null
+        else
+          hyprctl keyword animations:enabled 1 &>/dev/null
+        fi
+        ;;
+      blur)
+        cur=$(hyprctl getoption decoration:blur:enabled -j 2>/dev/null | jq -r '.bool // false')
+        if [[ "$cur" == "true" ]]; then
+          hyprctl keyword decoration:blur:enabled 0 &>/dev/null
+        else
+          hyprctl keyword decoration:blur:enabled 1 &>/dev/null
+        fi
+        ;;
+    esac
+    echo "ok"
+    ;;
+
+  set-power-profile)
+    prof="${1:-balanced}"
+    if which powerprofilesctl &>/dev/null; then
+      powerprofilesctl set "$prof" 2>/dev/null || true
+    fi
+    echo "ok"
+    ;;
+
+  toggle-mic)
+    if which wpctl &>/dev/null; then
+      wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle 2>/dev/null || true
+    fi
+    echo "ok"
+    ;;
+
+  save-crosshair)
+    # Save crosshair settings: $1 = enabled (true/false), $2 = style, $3 = color, $4 = size
+    en="${1:-false}"
+    sty="${2:-dot}"
+    col="${3:-#00FF66}"
+    sz="${4:-16}"
+    cat << EOF > "$CACHE_DIR/crosshair.json"
+{
+  "enabled": $en,
+  "style": "$sty",
+  "color": "$col",
+  "size": $sz
+}
+EOF
+    echo "ok"
+    ;;
+
+  list-games)
+    # Search for running game processes and clients
+    games="[]"
+    if which hyprctl &>/dev/null; then
+      clients=$(hyprctl clients -j 2>/dev/null || echo "[]")
+      games=$(echo "$clients" | jq -c '
+        [.[] | select(
+          (.class | test("steam_app_|heroic|lutris|wine|retroarch|ryujinx|rpcs3|dolphin|osu|cs2|valheim|factorio"; "i")) or
+          (.initialClass | test("steam_app_|heroic|lutris|wine"; "i")) or
+          (.tearingHint == true) or
+          ((.fullscreen == 1 or .fullscreen == 2) and (.class != "antigravity" and .class != "foot" and .class != "kitty" and .class != "zen-browser" and .class != "chromium" and .class != "firefox"))
+        ) | {
+          pid: .pid,
+          title: .title,
+          class: .class,
+          fullscreen: .fullscreen,
+          workspace: .workspace.name
+        }]
+      ')
+    fi
+    echo "$games"
+    ;;
+
+  boost-game)
+    pid="${1:-}"
+    if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
+      renice -n -5 -p "$pid" 2>/dev/null || true
+      which notify-send &>/dev/null && notify-send -u low -i input-gaming "Gaming Hub" "Game Process (PID $pid) Boosted to High Priority (-5)" || true
+    fi
+    echo "ok"
+    ;;
+
+  kill-game)
+    pid="${1:-}"
+    if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
+      kill -9 "$pid" 2>/dev/null || true
+      which notify-send &>/dev/null && notify-send -u low -i process-stop "Gaming Hub" "Terminated Game Process PID $pid" || true
+    fi
+    echo "ok"
+    ;;
+
+  install-tools)
+    if which omarchy &>/dev/null; then
+      omarchy install app 'MangoHud & GameMode' 'mangohud gamemode gamescope' 2>/dev/null || true
+    else
+      echo "omarchy command not found" >&2
+      exit 1
+    fi
+    ;;
+
+  launch-game)
+    target="${1:-steam}"
+    case "$target" in
+      steam)
+        nohup steam </dev/null &>/dev/null &
+        ;;
+      heroic)
+        nohup heroic </dev/null &>/dev/null &
+        ;;
+      lutris)
+        nohup lutris </dev/null &>/dev/null &
+        ;;
+    esac
+    echo "launched $target"
+    ;;
+
+  send-hud-toggle)
+    if which wtype &>/dev/null; then
+      wtype -M shift -k F12 -m shift 2>/dev/null || true
+    fi
+    echo "ok"
+    ;;
+
+  *)
+    echo "Usage: $0 {status|boost|toggle-fps|set-preset|set-fps-cap|set-position|toggle-feature|toggle-hypr|set-power-profile|toggle-mic|save-crosshair|list-games|boost-game|kill-game|install-tools|launch-game|send-hud-toggle}" >&2
+    exit 1
+    ;;
+esac

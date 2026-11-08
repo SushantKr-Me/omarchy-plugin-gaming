@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "sushantkr.gaming",
+  "name": "Gaming Hub",
+  "version": "1.0.0",
+  "author": "sushantkr",
+  "license": "MIT",
+  "description": "Comprehensive Omarchy Gaming Hub: one-click Game Boost mode, live FPS overlay toggle (MangoHud), presets, tearing/VRR optimizer, active game radar, hardware monitor, and on-screen crosshair.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Gaming Hub",
+    "description": "Game Boost, FPS overlay toggle, MangoHud controller, and active game radar",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
